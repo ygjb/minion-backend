@@ -18,7 +18,7 @@ import inspect
 
 cfg = backend_config()
 app = Flask(__name__)
-app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:////home/minion/minion.db'
+app.config['SQLALCHEMY_DATABASE_URI'] = cfg['sqlalchemy'][cfg['sqlalchemy']['database']]
 db = SQLAlchemy(app)
 
 
