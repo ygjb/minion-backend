@@ -124,7 +124,7 @@ def scan_finish(scan_id, state, t, failure=None):
             callback = config.get('callback')
             if callback:
                 r = requests.post(callback['url'], headers={"Content-Type": "application/json"},
-                                  data=json.dumps({'event': 'scan-state', 'id': scan.uuid, 'state': state}))
+                                  data=json.dumps({'event': 'scan-state', 'id': scan.scan_uuid, 'state': state}))
                 r.raise_for_status()
         except Exception as e:
             logger.exception("(Ignored) failure while calling scan state callback for scan %s" % scan['id'])
@@ -171,7 +171,7 @@ def scan_stop(scan_id):
         #
         # Set the scan to cancelled. Even though some plugins may still run.
         #
-        logger.debug("Stopping scan %s [%s -> STOPPED]" % (scan.uuid, scan.state))
+        logger.debug("Stopping scan %s [%s -> STOPPED]" % (scan.scan_uuid, scan.state))
         scan.state = "STOPPED"
         scan.started = datetime.datetime.utcnow()
 
@@ -226,7 +226,7 @@ def session_set_task_id(scan_id, session_id, task_id):
     scan = Scan.get_scan(scan_id)
     logger.debug("Setting task id for session [%s]" % (session_id))
     for s in scan.sessions:
-        if s.uuid == session_id:
+        if s.session_uuid == session_id:
             s.task = task_id
     db.session.commit()
 
@@ -601,7 +601,7 @@ def scan(scan_id):
         #
         # See if the scan exists.
         #
-        logger.debuging("Retrieving scan for scan() [%s]" % scan_id)
+        logger.debug("Retrieving scan for scan() [%s]" % scan_id)
         scan = get_scan(cfg['api']['url'], scan_id)
         if not scan:
             logger.error("Cannot load scan %s" % scan_id)

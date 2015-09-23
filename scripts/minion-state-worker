@@ -7,4 +7,3 @@ exec celery -A minion.backend.tasks worker \
   --loglevel=INFO \
   -Q state -n state -B \
   --schedule=/var/lib/minion/celerybeat-schedule \
-  --workdir=/opt/minion/minion-backend/minion
