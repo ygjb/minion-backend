@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+﻿#!/usr/bin/env python
 
 import calendar
 import datetime
@@ -9,8 +9,8 @@ from flask import jsonify, request
 import minion.backend.utils as backend_utils
 import minion.backend.tasks as tasks
 from minion.backend.app import app
-from minion.backend.views.base import api_guard, backend_config, invites, users, groups, sites
-from minion.backend.views.users import _find_groups_for_user, _find_sites_for_user, update_group_association, remove_group_association
+from minion.backend.models import Invite, User
+from minion.backend.views.base import api_guard, backend_config
 
 def send_email(action_type, data, extra_data=None):
     if action_type == 'invite':
@@ -23,7 +23,7 @@ def send_email(action_type, data, extra_data=None):
         return jsonify(success=False, reason="Sender email requires authentication.")
     except smtplib.SMTPRecipientsRefused:
         return jsonify(success=False, reason="Recipient refused to receive email.")
-    except smtplib.SMTPException:
+    except smtplib.SMTPException:   
         return jsonify(success=False, reason="Unable to send email.")
 
 def send_invite(invite_data, base_url):
@@ -53,13 +53,6 @@ def notify_on_action(action_type, invite_data):
         "new_user_name": invite_data['recipient_name'],
         "subject": subject}
     return email_data
-
-def search(model, filters=None):
-    if filters:
-        filters = {field: value for field, value in filters.iteritems() if value is not None}
-        return model.find(filters)
-    else:
-        return model.find()
 
 def sanitize_invite(invite):
     if invite.get('_id'):
@@ -97,9 +90,11 @@ def sanitize_invites(invite_results):
 def create_invites():
     recipient = request.json['recipient']
     sender = request.json['sender']
-    recipient_user = users.find_one({'email': recipient})
-    recipient_invite = invites.find_one({'recipient': recipient})
-    sender_user = users.find_one({'email': sender})
+    recipient_user = User.get_user(recipient)
+    recipient_invite = None
+    if len(Invite.query.filter_by(email = recipient).all()) > 0:
+        recipient_invite = Invite.query.filter_by(email = recipient).one()
+    sender_user = User.get_user(sender)
     # issue #120
     # To ensure no duplicate invitation is allowed, and to ensure
     # we don't corrupt user record in user table, any POST invitation
@@ -119,6 +114,8 @@ def create_invites():
     if not sender_user:
         return jsonify(success=False,
                 reason='sender-not-found-in-user-record')
+
+    invite = Invite(recipient, )
 
     invite_id = str(uuid.uuid4())
     # some users may not have name filled out?
@@ -168,8 +165,9 @@ def create_invites():
 def get_invites():
     recipient = request.args.get('recipient', None)
     sender = request.args.get('sender', None)
-    results = search(invites, filters={'sender': sender, 'recipient': recipient})
+    results = Invite.query.all()
     return jsonify(success=True, invites=sanitize_invites(results))
+
 
 # 
 # GET an invitation record given the invitation id
@@ -191,7 +189,7 @@ def get_invites():
 @app.route('/invites/<id>', methods=['GET'])
 @api_guard
 def get_invite(id):
-    invitation = invites.find_one({'id': id})
+    invitation = Invite.get_invite(id)
     if invitation:
         return jsonify(success=True, invite=sanitize_invite(invitation))
     else:
@@ -204,16 +202,15 @@ def get_invite(id):
 @app.route('/invites/<id>', methods=['DELETE'])
 @api_guard
 def delete_invite(id):
-    invitation = invites.find_one({'id': id})
+    invitation = Invite.get_invite(id)
     if not invitation:
         return jsonify(success=False, reason='no-such-invitation')
     # do not delete users that are not invite pending (bug #123)
     email = invitation['recipient']
-    user = users.find_one({'email': email})
+    user = User.get_user(email)
     if user and user.get('status') == "invited":
-        users.remove(user)
-        # bug #133 delete user associations
-        remove_group_association(email)
+        db.session.remove(user)
+        db.session.commit()    
         
     invites.remove({'id': id})
     return jsonify(success=True)
@@ -229,7 +226,7 @@ def update_invite(id):
     timenow = datetime.datetime.utcnow()
     action = request.json['action'].lower()
     
-    invitation = invites.find_one({'id': id})
+    invitation = Invite.get_invite(id)
     if invitation:
         max_time_allowed = invitation.get('max_time_allowed') \
             or backend_config.get('invitation').get('max_time_allowed')
@@ -241,7 +238,7 @@ def update_invite(id):
         accepted_on = invitation['accepted_on']
         expire_on = invitation['expire_on']
 
-        user = users.find_one({'email': recipient})
+        user = User.get_user(recipient)
         if user is None:
             return jsonify(success=False, reason="user-not-created")
         if accepted_on is not None:
@@ -275,11 +272,10 @@ def update_invite(id):
                 invites.update({'id': id},{'$set': 
                     {'accepted_on': invitation['accepted_on'],
                      'status': 'used'}})
-                users.update({'email': recipient}, {'$set': 
-                    {'status': 'active', \
-                     'email': request.json['login']}})
-                if invitation['recipient'] != request.json['login']:
-                    update_group_association(invitation['recipient'], request.json['login'])
+                user = User.get_user(recipient)
+                user.status = 'active'
+                user.email = request.json['login']
+                db.session.commit()
                 # if user's persona email is different
                 invitation['recipient'] = request.json['login']
                 # notify inviter if he chooses to receive such notification
@@ -289,12 +285,11 @@ def update_invite(id):
         elif action == 'decline':
             invitation['status'] = 'declined'
             invites.update({'id': id}, {'$set': {'status': 'declined'}})
-            users.remove(user)
-            remove_group_association(invitation['recipient'])
+            db.session.remove(user)
+            db.commit()
             # notify inviter if he chooses to
             if "decline" in invitation['notify_when']:
                 send_email('decline', invitation)
             return jsonify(success=True, invite=sanitize_invite(invitation))
     else:
         return jsonify(success=False, reason='invitation-does-not-exist')
-

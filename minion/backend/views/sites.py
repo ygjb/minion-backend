@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+﻿#!/usr/bin/env python
 
 import calendar
 import datetime
@@ -9,15 +9,18 @@ from celery.schedules import crontab_parser, ParseException
 
 from minion.backend.app import app
 import minion.backend.tasks as tasks
-from minion.backend.views.base import _check_required_fields, api_guard, groups, sites, scanschedules, siteCredentials
+from minion.backend.views.base import api_guard
 from minion.backend.views.groups import _check_group_exists
-from minion.backend.views.plans import _check_plan_exists
+from minion.backend.models import db, Group, Site, ScanSchedule, SiteCredential, Plan
+
+import json
 
 def _check_site_url(url):
     regex = re.compile(r"^((http|https)://(localhost|([a-z0-9][-a-z0-9]*)(\.[a-z0-9][-a-z0-9]*)+)(:\d+)?)"
                        r"|"
                        r"((([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/(\d|[1-2]\d|3[0-2]))?)$")
     return regex.match(url) is not None
+
 
 #def _check_required_fields(expected, fields):
 #    for field in fields:
@@ -26,15 +29,8 @@ def _check_site_url(url):
 #    return True
 
 def _find_groups_for_site(site):
-    """Find all the groups the site is part of"""
-    return [g['name'] for g in groups.find({"sites":site})]
+    return Site.get_site(site).groups
 
-def sanitize_site(site):
-    if '_id' in site:
-        del site['_id']
-    if 'created' in site:
-        site['created'] = calendar.timegm(site['created'].utctimetuple())
-    return site
 
 
 def check_cron(crontab):
@@ -98,11 +94,10 @@ def check_cron(crontab):
 @app.route('/sites/<site_id>', methods=['GET'])
 @api_guard
 def get_site(site_id):
-    site = sites.find_one({'id': site_id})
+    site = Site.get_site(site_id)
     if not site:
         return jsonify(success=False, reason='no-such-site')
-    site['groups'] = _find_groups_for_site(site['url'])
-    return jsonify(success=True, site=sanitize_site(site))
+    return jsonify(success=True, site=site.dict())
 
 #
 # Expects a partially filled out site as POST data:
@@ -132,37 +127,45 @@ def get_site(site_id):
 def create_site():
     site = request.json
     # Verify incoming site: url must be valid, groups must exist, plans must exist
+
     if not _check_site_url(site.get('url')):
         return jsonify(success=False, reason='invalid-url')
-    if not _check_required_fields(site, ['url']):
+    if not site.get('url', None):
         return jsonify(success=False, reason='missing-required-field')
     for group in site.get('groups', []):
-        if not _check_group_exists(group):
+        if not Group.get_group(group):
             return jsonify(success=False, reason='unknown-group')
     for plan_name in site.get('plans', []):
-        if not _check_plan_exists(plan_name):
+        if not Plan.get_plan(plan_name):
             return jsonify(success=False, reason='unknown-plan')
-    if sites.find_one({'url': site['url']}) is not None:
+    if Site.get_site_by_url(site['url']) is not None:
         return jsonify(success=False, reason='site-already-exists')
+
+
+
+
     # Create the site
-    new_site = { 'id': str(uuid.uuid4()),
-                 'url':  site['url'],
-                 'plans': site.get('plans', []),
-                 'created': datetime.datetime.utcnow()}
+    new_site = Site(site['url'])
+
+    for plan in site.get('plans', []):
+        new_site.plans.append(Plan.get_plan(plan))
+    new_site.created = datetime.datetime.utcnow()
+
+    for group in site.get('groups', []):
+        new_site.groups.append(Group.get_group(group))
 
     if site.get('verification',{}).get('enabled',False):
-        new_site['verification'] = {'enabled': True, 'value': str(uuid.uuid4())}
+        new_site.verification_enabled = True
+        new_site.verification_value = str(uuid.uuid4())
     else:
-        new_site['verification'] = {'enabled': False, 'value': None}
+        new_site.verification_enabled = False
+        new_site.verification_value = None
 
-    sites.insert(new_site)
-    # Add the site to the groups - group membership is stored in the group object, not in the site
-    for group_name in site.get('groups', []):
-        # No need to check if the site is already in the group as we just added the site
-        groups.update({'name':group_name},{'$addToSet': {'sites': site['url']}})
-    new_site['groups'] = site.get('groups', [])
+    db.session.add(new_site)
+    db.session.commit()
+    new_site = Site.get_site(new_site.site_uuid)
     # Return the new site
-    return jsonify(success=True, site=sanitize_site(new_site))
+    return jsonify(success=True, site=new_site.dict())
 
 #
 # Expects a partially filled out site as POST data. The site with the
@@ -197,48 +200,43 @@ def create_site():
 def update_site(site_id):
     new_site = request.json
     # Verify incoming site. It must exist, groups must exist, plans must exist.
-    site = sites.find_one({'id': site_id})
+    site = Site.get_site(site_id)
+
     if not site:
         return jsonify(success=False, reason='no-such-site')
-    site['groups'] = _find_groups_for_site(site['url'])
+    
     for group in new_site.get('groups', []):
-        if not _check_group_exists(group):
+        if not Group.get_group(group):
             return jsonify(success=False, reason='unknown-group')
     for plan_name in new_site.get('plans', []):
-        if not _check_plan_exists(plan_name):
+        if not Plan.get_plan(plan_name):
             return jsonify(success=False, reason='unknown-plan')
+
+    
+
     if 'groups' in new_site:
-        # Add new groups
+        # purge groups
+        for group in site.groups:
+            site.groups.remove(group)
+
+        # insert desired groups
         for group_name in new_site.get('groups', []):
-            if group_name not in site['groups']:
-                groups.update({'name':group_name},{'$addToSet': {'sites': site['url']}})
-        # Remove old groups
-        for group_name in site['groups']:
-            if group_name not in new_site.get('groups', []):
-                groups.update({'name':group_name},{'$pull': {'sites': site['url']}})
+            site.groups.append(Group.get_group(group_name))
 
     if 'plans' in new_site:
-        # Update the site. At this point we can only update plans.
-        sites.update({'id': site_id}, {'$set': {'plans': new_site.get('plans')}})
+        #purge plans
+        for plan in site.plans:
+            site.plans.remove(plan)
+        #add new plans
+        for plan_name in new_site['plans']:
+            site.plans.append(Plan.get_plan(plan_name))
 
-    new_verification = new_site['verification']
-    old_verification = site.get('verification')
-    # if site doesn't have 'verification', do us a favor, update the document as it is outdated!
-    if not old_verification or old_verification['enabled'] != new_verification['enabled']:
-        # to make logic simpler, even if the new request wants to
-        # disable verification, generate a new value anyway.
-        sites.update({'id': site_id},
-            {'$set': {
-                 'verification': {
-                    'enabled': new_verification['enabled'],
-                    'value': str(uuid.uuid4())}}})
-
+    db.session.commit()
     # Return the updated site
-    site = sites.find_one({'id': site_id})
+    site = Site.get_site(site_id)
     if not site:
         return jsonify(success=False, reason='no-such-site')
-    site['groups'] = _find_groups_for_site(site['url'])
-    return jsonify(success=True, site=sanitize_site(site))
+    return jsonify(success=True, site=site.dict())
 
 #
 # Returns a list of sites or return the site matches the query. Currently
@@ -260,94 +258,91 @@ def update_site(site_id):
 def get_sites():
     query = {}
     url = request.args.get('url')
+    sitez = None
     if url:
-        query['url'] = url
-    sitez = [sanitize_site(site) for site in sites.find(query)]
-    for site in sitez:
-        site['groups'] = _find_groups_for_site(site['url'])
+        sitez = [ Site.get_site_by_url(url)]
+    else:
+        sitez = Site.query.all()
 
-    return jsonify(success=True, sites=sitez)
+    return jsonify(success=True, sites=map(lambda x : x.dict(), sitez))
 
 
+
+
+
+
+
+
+
+
+
+#XXX help
 # Returns credential Info exept for password from siteCredentials collection
 @app.route('/credInfo', methods=['GET'])
 @api_guard
 def get_credInfo():
     credInfo = {}
-    for site in siteCredentials.find():
 
-        authData = site['authData']
-        data = {
-            'site':site['site'],
-            'plan':site['plan'],
-            'authData': site['authData']
-        }
 
-        #remove password from the response
-        data['authData']['password'] = ""
-        if not site['site'] in credInfo:
-            credInfo[site['site']] = {}
-
-        credInfo[site['site']][site['plan']] = data
+    for site in SiteCredential.query.all():
+        cred = site.dict()
+        credInfo[cred['site']] = credInfo.get(cred['site'], {})
+        credInfo[cred['site']][cred['plan']] = cred['authData']
 
 
     return jsonify(success=True, credInfo=credInfo)
 
 
+
+#xxx help
 # Sets siteCredentials
 @app.route('/setCredentials', methods=["POST"])
+@api_guard('application/json')
 def setCredentials():
     cred_data = request.json
-    site = cred_data.get('site')
-    plan = cred_data.get('plan')
+    site = Site.get_site_by_url(cred_data.get('site'))
+    if not site:
+        return jsonify(message="no-such-site", success=False)
+    plan = Plan.get_plan(cred_data.get('plan'))
+    if not plan:
+        return jsonify(message="no-such-site", success=False)
+
     authData = cred_data.get('authData')
 
-    data = {
-        'site':site,
-        'plan':plan,
-        'authData':authData
-    }
 
-    if authData.get('remove'):
-        siteCredentials.remove({'site':site, 'plan':plan})
-        return jsonify(message="Removed Site Credentials", success=True)
+    siteCreds = SiteCredential.get_credential(site.id, plan.id)
 
-
-    # Insert/Update credentials
-    siteCreds = siteCredentials.find_one({"site":site, "plan":plan})
     if not siteCreds:
-      siteCredentials.insert(data)
-    else:
-      #Update everything else except password unless requested
-      updatedAuthData = {
-        'authData.method':authData.get('method'),
-        'authData.url': authData.get('url'),
-        'authData.email': authData.get('email'),
-        'authData.before_login_element_xpath': authData.get('before_login_element_xpath'),
-        'authData.login_button_xpath': authData.get('login_button_xpath'),
-        'authData.login_script': authData.get('login_script'),
-        'authData.after_login_element_xpath': authData.get('after_login_element_xpath'),
-        'authData.username': authData.get('username'),
-        'authData.username_field_xpath' : authData.get('username_field_xpath'),
-        'authData.password_field_xpath' : authData.get('password_field_xpath'),
-        'authData.expected_cookies' : authData.get('expected_cookies')
-      }
+        siteCreds = SiteCredential(site.id, plan.id)
+        db.session.add(siteCreds)
 
-      # If password is non-blank, update it
-      password = authData.get('password')
-      if password:
-        updatedAuthData['authData.password'] = password
+    #update all fields, preserving values for which none was provided
+    siteCreds.site_id = site.id
+    siteCreds.plan_id = plan.id
+    siteCreds.username = authData.get('username', siteCreds.username)
+    siteCreds.emailaddress = authData.get('email', siteCreds.emailaddress)
+    siteCreds.script = authData.get('script', siteCreds.script)
+    siteCreds.url = authData.get('url', siteCreds.url)
+    siteCreds.username_path = authData.get('meusername_field_xpathhod', siteCreds.username_path)
+    siteCreds.password_path = authData.get('password_field_xpath', siteCreds.password_path)
+    siteCreds.method = authData.get('method', siteCreds.method)
+    siteCreds.cookies = authData.get('expected_cookies', siteCreds.cookies)
+    siteCreds.before_login_path = authData.get('before_login_element_xpath', siteCreds.before_login_path)
+    siteCreds.after_login_path = authData.get('after_login_element_xpath', siteCreds.after_login_path)
+    siteCreds.button_path = authData.get('before_login_element_xpath', siteCreds.button_path)
 
 
-      siteCredentials.update({"site":site, "plan":plan},
-                       {"$set": updatedAuthData});
+    db.session.commit()
+    return jsonify(credential = siteCreds.dict(), success=True)
 
-    return jsonify(message="Added Site Credentials", success=True)
+
 
 
 @app.route('/scanschedule', methods=["POST"])
 def scanschedule():
     site = request.json
+
+
     scan_id = site.get('scan_id')
     schedule = site.get('schedule')
 
@@ -368,6 +363,8 @@ def scanschedule():
     else:
         enabled = True
         message="Scheduled Scan successfully set for site: " + target
+
+
 
     crontab = {
       'minute':str(schedule.get('minute')),
@@ -397,10 +394,15 @@ def scanschedule():
     }
 
     # Insert/Update existing schedule by target and plan
+    schedule = ScanSchedule.get_schedule(site, plan)
+
     schedule = scanschedules.find_one({"site":target, "plan":plan})
     if not schedule:
-      scanschedules.insert(data)
+      schedule = ScanSchedule()
+      schedule.data = json.dumps(data)
     else:
+      old_data = json.loads(schedule.data)
+      schedule.data = json.dumps(old_data.update(data))
       scanschedules.update({"site":target, "plan":plan},
                        {"$set": {"crontab": crontab, "enabled":enabled}});
 

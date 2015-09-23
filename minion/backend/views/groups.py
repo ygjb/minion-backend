@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+﻿#!/usr/bin/env python
 
 import calendar
 import datetime
@@ -8,17 +8,14 @@ from flask import jsonify, request
 import minion.backend.utils as backend_utils
 import minion.backend.tasks as tasks
 from minion.backend.app import app
-from minion.backend.views.base import _check_required_fields, api_guard, groups, users, sites
+from minion.backend.models import db, Group, User, Site
+from minion.backend.views.base import api_guard
 
 def _check_group_exists(group_name):
-    return groups.find_one({'name': group_name}) is not None
+    return Group.get_group(group_name) is not None
 
 def sanitize_group(group):
-    if '_id' in group:
-        del group['_id']
-    if 'created' in group:
-        group['created'] = calendar.timegm(group['created'].utctimetuple())
-    return group
+    return group.dict()
 
 # Retrieve all groups in minion
 #
@@ -36,7 +33,7 @@ def sanitize_group(group):
 @app.route('/groups', methods=['GET'])
 @api_guard
 def list_groups():
-    return jsonify(success=True, groups=[sanitize_group(group) for group in groups.find()])
+    return jsonify(success=True, groups=[sanitize_group(group) for group in Group.query.all()])
 
 #
 # Expects a partially filled out site as POST data:
@@ -64,39 +61,54 @@ def list_groups():
 def create_group():
     group = request.json
 
+
     # perform validations on incoming data; issue#132
     if not group.get('name'):
         return jsonify(success=False, reason='name-field-is-required')
 
-    userz = group.get('users')
-    sitez = group.get('sites')
+    userz = group.get('users', [])
+    sitez = group.get('sites', [])
 
     if userz:
         for user in userz:
-            if not users.find_one({'email': user}):
+            if not User.get_user(user):
                 return jsonify(success=False, reason='user %s does not exist'%user)
     if sitez:
         for site in sitez:
-            if not sites.find_one({'url': site}):
+            if not Site.get_site_by_url(site):
                 return jsonify(success=False, reason='site %s does not exist'%site)
 
-    if groups.find_one({'name': group['name']}) is not None:
+    if Group.get_group(group['name']) is not None:
         return jsonify(success=False, reason='group-already-exists')
 
     # post-validation
-    new_group = { 'id': str(uuid.uuid4()),
-                  'name':  group['name'],
-                  'description': group.get('description', ""),
-                  'sites': group.get('sites', []),
-                  'users': group.get('users', []),
-                  'created': datetime.datetime.utcnow() }
-    groups.insert(new_group)
+    # XXX - this is a horrible hack, we should grab the default admin user / admin group instead, not just use the first user/group in the list!!!!
+    admin_user = User.query.all()[0]
+    admin_group = None
+    if len(Group.query.all()) > 0:
+        admin_group = Group.query.all()[0]
+    new_group = Group(group['name'], admin_user.email, admin_group)
+    new_group.created = datetime.datetime.utcnow()
+    new_group.description = group.get('description', "")
+
+    db.session.add(new_group)
+    
+    for user in userz:
+        new_group.users.append(User.get_user(user))
+        
+
+    for site in sitez:
+        new_group.sites.append(Site.get_site_by_url(site))
+
+    db.session.commit()
+
+    new_group = Group.get_group(group['name'])
     return jsonify(success=True, group=sanitize_group(new_group))
 
 @app.route('/groups/<group_name>', methods=['GET'])
 @api_guard
 def get_group(group_name):
-    group = groups.find_one({'name': group_name})
+    group = Group.get_group(group_name)
     if not group:
         return jsonify(success=False, reason='no-such-group')
     return jsonify(success=True, group=sanitize_group(group))
@@ -110,10 +122,12 @@ def get_group(group_name):
 @app.route('/groups/<group_name>', methods=['DELETE'])
 @api_guard
 def delete_group(group_name):
-    group = groups.find_one({'name': group_name})
+    group = Group.get_group(group_name)
+
     if not group:
         return jsonify(success=False, reason='no-such-group')
-    groups.remove({'name': group_name})
+    db.session.delete(group)
+    db.session.commit()
     return jsonify(success=True)
 
 #
@@ -129,27 +143,49 @@ def delete_group(group_name):
 #    removeUsers: ["bar@bacon"] }
 #
 
+#XXX - Verify if this is used anywhere?  the API seems inconsistent?
 @app.route('/groups/<group_name>', methods=['PATCH'])
 @api_guard('application/json')
 def patch_group(group_name):
-    group = groups.find_one({'name': group_name})
+
+    patch = request.json
+
+    group = Group.get_group(group_name)
+    
     if not group:
         return jsonify(success=False, reason='no-such-group')
+
     # Process the edits. These can probably be done in one operation.
-    patch = request.json
-    for site in patch.get('addSites', []):
-        if isinstance(site, unicode) or isinstance(site, str):
-            groups.update({'name':group_name},{'$push': {'sites': site}})
-    for site in patch.get('removeSites', []):
-        if isinstance(site, unicode) or isinstance(site, str):
-            groups.update({'name':group_name},{'$pull': {'sites': site}})
-    for user in patch.get('addUsers', []):
-        if isinstance(user, unicode) or isinstance(user, str):
-            groups.update({'name':group_name},{'$push': {'users': user}})
+
+    for url in patch.get('addSites', []):
+        site = Site.get_site_by_url(url)
+        if not site:
+            return jsonoify(success = false, reason='no-such-site')
+        if not site in group.sites:
+            group.sites.append(site)
+
+    for url in patch.get('removeSites', []):
+        site = Site.get_site_by_url(url)
+        if not site:
+            return jsonoify(success = false, reason='no-such-site')
+        if site in group.sites:
+            group.sites.remove(site)
+    
+    for email in patch.get('addUsers', []):
+        user = User.get_user(email)
+        if not user:
+            return jsonoify(success = false, reason='no-such-user')
+        if not user in group.users:
+            group.users.append(user)
+
     for user in patch.get('removeUsers', []):
-        if isinstance(user, unicode) or isinstance(user, str):
-            groups.update({'name':group_name},{'$pull': {'users': user}})
-    # Return the modified group
-    group = groups.find_one({'name': group_name})
+        user = User.get_user(email)
+        if not user:
+            return jsonoify(success = false, reason='no-such-user')
+        if user in group.users:
+            group.users.remove(user)
+
+    db.session.commit()
+    group = Group.get_group(group_name)
     return jsonify(success=True, group=sanitize_group(group))
 

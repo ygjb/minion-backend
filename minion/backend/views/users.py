@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+﻿#!/usr/bin/env python
 
 import calendar
 import datetime
@@ -6,64 +6,55 @@ import uuid
 from flask import jsonify, request
 
 from minion.backend.app import app
-from minion.backend.views.base import api_guard, groups, sites, users
+from minion.backend.models import db, Group, User, Site
+from minion.backend.views.base import api_guard
 from minion.backend.views.groups import _check_group_exists
 
-def _find_groups_for_user(email):
-    """Find all the groups the user is in. """
-    return [g['name'] for g in groups.find({"users":email})]
+#xxx
+import json
 
+
+# XXX needed?
 def _find_sites_for_user_by_group_name(email, group_name):
     """ Find all sites that user has access to in a
     given group. """
-    group = groups.find_one({'name': group_name, 'users': email})
-    if not group:
-        return jsonify(success=False, reason="Group not found.")
-    return group['sites']
+    group = Group.get_group(group_name)
+    user = User.get_user(email)
+    if not user or not group:
+        return []
+    if not user in group.users:
+        return []
+    return map(lambda x: x.url, group.sites)
 
-def _find_sites_for_user(email):
-    """Find all sites that the user has access to"""
-    sitez = set()
-    for g in groups.find({"users":email}):
-        for s in g['sites']:
-            sitez.add(s)
-    return list(sitez)
 
-def update_group_association(old_email, new_email):
-    """ Update all associations with the old email
-    to the new email. """
-
-    groups.update({'users': old_email},
-        {'$set': {'users.$': new_email}},
-        upsert=False,
-        multi=True)
-
-def remove_group_association(email):
-    """ Remove all associations with the recipient.
-    This is required for a declined invitation
-    or when a user is banned or deleted.
-
-    In case we have found a user in the same
-    membership list multiple time (should not
-    happen), we better to pull all the
-    occurences out. Hence why we use
-    $pull over $pop."""
-
-    groups.update({'users': email},
-        {'$pull': {'users': email}},
-        upsert=False,
-        multi=True)
+# XXX - this function should be deleted as Group.add_user(username) / Group.remove_user(username) will maintain these
+# def update_group_association(old_email, new_email):
+#    """ Update all associations with the old email
+#    to the new email. """
+#
+#    groups.update({'users': old_email},
+#        {'$set': {'users.$': new_email}},
+#        upsert=False,
+#        multi=True)
+#
+#def remove_group_association(email):
+#    """ Remove all associations with the recipient.
+#    This is required for a declined invitation
+#    or when a user is banned or deleted.
+#
+#    In case we have found a user in the same
+#    membership list multiple time (should not
+#    happen), we better to pull all the
+#    occurences out. Hence why we use
+#    $pull over $pop."""
+#
+#    groups.update({'users': email},
+#        {'$pull': {'users': email}},
+#        upsert=False,
+#        multi=True)
 
 def sanitize_user(user):
-    if '_id' in user:
-        del user['_id']
-    created = user.get('created')
-    last_login = user.get('last_login')
-    if created:
-        user['created'] = calendar.timegm(created.utctimetuple())
-    if last_login:
-        user['last_login'] = calendar.timegm(last_login.utctimetuple())
-    return user
+    return user.dict()
 
 # API Methods to manage users
 
@@ -71,15 +62,15 @@ def sanitize_user(user):
 @api_guard('application/json')
 def login_user():
     email = request.json['email']
-    user = users.find_one({'email': email})
+    user = User.get_user(email)
     if user:
-        if user['status'] == 'active':
+        if user.status == 'active':
             timestamp = datetime.datetime.utcnow()
-            users.update({'email': email}, {'$set': {'last_login': timestamp}})
-            user = users.find_one({'email': email})
+            user.last_login = timestamp
+            db.session.commit()
             return jsonify(success=True, user=sanitize_user(user))
         else:
-            return jsonify(success=False, reason=user['status'])
+            return jsonify(success=False, reason=user.status)
     else:
         return jsonify(success=False, reason='user-does-not-exist')
 
@@ -87,11 +78,9 @@ def login_user():
 @api_guard
 def get_user(email):
     email = email.lower()
-    user = users.find_one({'email': email})
+    user = User.get_user(email)
     if not user:
         return jsonify(success=False, reason='no-such-user')
-    user['groups'] = _find_groups_for_user(user['email'])
-    user['sites'] = _find_sites_for_user(user['email'])
     return jsonify(success=True, user=sanitize_user(user))
 
 #
@@ -124,30 +113,30 @@ def get_user(email):
 def create_user():
     user = request.json
     # Verify incoming user: email must not exist yet, groups must exist, role must exist
-    if users.find_one({'email': user['email']}) is not None:
+    if User.get_user(user["email"]) is not None:
         return jsonify(success=False, reason='user-already-exists')
 
     for group_name in user.get('groups', []):
-        if not _check_group_exists(group_name):
+        if not Group.get_group(group_name):
             return jsonify(success=False, reason='unknown-group')
 
     if user.get("role") not in ("user", "administrator"):
         return jsonify(success=False, reason="invalid-role")
 
-    new_user = { 'id': str(uuid.uuid4()),
-                 'status': 'invited' if user.get('invitation') else 'active',
-                 'email':  user['email'],
-                 'name': user.get('name'),
-                 'role': user['role'],
-                 'created': datetime.datetime.utcnow(),
-                 'last_login': None,
-                 'api_key': str(uuid.uuid4()) }
-    users.insert(new_user)
+    new_user = User(user.get('name'), user['email'])
+    new_user.created = datetime.datetime.utcnow()
+    new_user.status = 'invited' if user.get('invitation') else 'active'
+    new_user.role = user['role']
+    new_user.last_login = None
+    api_key = str(uuid.uuid4())
 
-    # Add the user to the groups - group membership is stored in the group objet, not in the user
+    db.session.add(new_user)
+    db.session.commit()
+
     for group_name in user.get('groups', []):
-        groups.update({'name':group_name},{'$addToSet': {'users': user['email']}})
-    new_user['groups'] = user.get('groups', [])
+        new_user.groups.append(Group.get_group(group_name))
+
+    db.session.commit()
     return jsonify(success=True, user=sanitize_user(new_user))
 
 #
@@ -172,15 +161,14 @@ def create_user():
 def update_user(user_email):
     new_user = request.json
     # Verify the incoming user: user must exist, groups must exist, role must exist
-    old_user = users.find_one({'email': user_email})
+
+    old_user = User.get_user(user_email)
     if old_user is None:
         return jsonify(success=False, reason='unknown-user')
-    old_user['groups'] = _find_groups_for_user(user_email)
-    old_user['sites'] = _find_sites_for_user(user_email)
 
     if 'groups' in new_user:
         for group_name in new_user.get('groups', []):
-            if not _check_group_exists(group_name):
+            if not Group.get_group(group_name):
                 return jsonify(success=False, reason='unknown-group')
     if 'role' in new_user:
         if new_user["role"] not in ("user", "administrator"):
@@ -188,32 +176,32 @@ def update_user(user_email):
     if 'status' in new_user:
         if new_user['status'] not in ('active', 'banned'):
             return jsonify(success=False, reason='unknown-status-option')
+
     # Update the group memberships
     if 'groups' in new_user:
-        # Add new groups
-        for group_name in new_user.get('groups', []):
-            if group_name not in old_user['groups']:
-                groups.update({'name':group_name},{'$addToSet': {'users': user_email}})
-        # Remove old groups
-        for group_name in old_user['groups']:
-            if group_name not in new_user.get('groups', []):
-                groups.update({'name':group_name},{'$pull': {'users': user_email}})
+        #clear all groups
+        for group in old_user.groups:
+            old_user.groups.remove(group)
+        #add new groups
+        for group in new_user.get('groups', []):
+            old_user.groups.append(Group.get_group(group))
+    
     # Modify the user
     changes = {}
     if 'name' in new_user:
-        changes['name'] = new_user['name']
+        old_user.name = new_user['name']
     if 'role' in new_user:
-        changes['role'] = new_user['role']
-    if 'groups' in new_user:
-        changes['groups'] = new_user['groups']
+        old_user.role = new_user['role']
+        
     if 'status' in new_user:
-        changes['status'] = new_user['status']
-    users.update({'email': user_email}, {'$set': changes})
+        old_user.status = new_user['status']
+
+    db.session.commit()
+    
     # Return the updated user
-    user = users.find_one({'email': user_email})
+    user = User.get_user(user_email)
     if not user:
         return jsonify(success=False, reason='unknown-user')
-    user['groups'] = _find_groups_for_user(user_email)
     return jsonify(success=True, user=sanitize_user(user))
 
 #
@@ -234,11 +222,7 @@ def update_user(user_email):
 @app.route('/users', methods=['GET'])
 @api_guard
 def list_users():
-    userz = []
-    for user in users.find():
-        user['groups'] = _find_groups_for_user(user['email'])
-        user['sites'] = _find_sites_for_user(user['email'])
-        userz.append(sanitize_user(user))
+    userz = map(lambda x : x.dict(), User.query.all())
     return jsonify(success=True, users=userz)
 
 #
@@ -250,11 +234,10 @@ def list_users():
 @app.route('/users/<user_email>', methods=['DELETE'])
 @api_guard
 def delete_user(user_email):
-    user = users.find_one({'email': user_email})
+    user = User.get_user(user_email)
     if not user:
         return jsonify(success=False, reason='no-such-user')
     # Remove the user
-    users.remove({'email': user_email})
-    # Remove user group membership
-    remove_group_association(user_email)
+    db.session.delete(user)
+    db.session.commit()
     return jsonify(success=True)

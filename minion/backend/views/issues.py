@@ -1,7 +1,9 @@
-#!/usr/bin/env python
+﻿#!/usr/bin/env python
 
 from flask import jsonify, request
-from minion.backend.views.base import api_guard, groups, sites, scans, sanitize_time
+from minion.backend.models import Scan, Site
+from minion.backend.views.base import api_guard
+from minion.backend.models import db, Group
 from minion.backend.app import app
 
 #
@@ -42,7 +44,7 @@ def get_issues():
 
     issues = []
 
-    group = groups.find_one({'name': request.args.get('group_name')})
+    group = Groups.get_group(request.args.get('group_name'))
     if group is not None:
         for target in group['sites']:
             scan = scans.find_one({"plan.name": request.args.get('plan_name'),

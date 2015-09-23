@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+﻿#!/usr/bin/env python
 
 import calendar
 import datetime
@@ -11,7 +11,10 @@ from flask import jsonify, request
 import minion.backend.utils as backend_utils
 import minion.backend.tasks as tasks
 from minion.backend.app import app
-from minion.backend.views.base import api_guard, plans, plugins, users, sites, groups
+from minion.backend.views.base import api_guard
+from minion.backend.models import db, User, Group, Site, Plan, Plugin, Workflow
+import json
+
 
 def _plan_description(plan):
     return {
@@ -21,7 +24,7 @@ def _plan_description(plan):
         'created' : plan['created'] }
 
 def get_plan_by_plan_name(plan_name):
-    return plans.find_one({'name': plan_name})
+    return Plan.get_plan(plan_name)
 
 def get_sanitized_plans():
     return [sanitize_plan(_plan_description(plan)) for plan in plans.find()]
@@ -40,19 +43,25 @@ def _check_plan_by_email(email, plan_name):
         return matches
 
 def get_plans_by_email(email):
-    plans = get_sanitized_plans()
-    matched_plans = [plan for plan in plans if _check_plan_by_email(email, plan["name"])]
-    return matched_plans
+    user = User.get_user(email)
+    plans_by_site = map(lambda x:Site.get_site_by_url(x).plans, user.sites())
+    plans = []
+    for planlist in plans_by_site:
+        for plan in planlist:
+            if not plan in plans:
+                plans.append(plan)
+    return map(lambda x : x.dict(), plans)
+    
 
 def permission(view):
     @functools.wraps(view)
     def has_permission(*args, **kwargs):
         email = request.args.get('email')
         if email:
-            user = users.find_one({'email': email})
+            user = User.get_user(email)
             if not user:
                 return jsonify(success=False, reason='User does not exist.')
-            if user['role'] == 'user':
+            if user.role == 'user':
                 plan_name = request.view_args['plan_name']
                 if not _check_plan_by_email(email, plan_name):
                     return jsonify(success=False, reason="Plan does not exist.")
@@ -60,12 +69,7 @@ def permission(view):
     return has_permission
 
 def sanitize_plan(plan):
-    if plan.get('_id'):
-        del plan['_id']
-    for field in ('created',):
-        if plan.get(field) is not None:
-            plan[field] = calendar.timegm(plan[field].utctimetuple())
-    return plan
+    return plan.dict()
 
 def _split_plugin_class_name(plugin_class_name):
     e = plugin_class_name.split(".")
@@ -76,25 +80,25 @@ def _import_plugin(plugin_class_name):
     plugin_module = importlib.import_module(package_name, class_name)
     return getattr(plugin_module, class_name)
 
-def _check_plan_workflow(workflow):
+def create_workflows_from_json(workflow):
     """ Ensure plan workflow contain valid structure. """
-    if not all(isinstance(plugin, dict) for plugin in workflow):
-        return False
-    required_fields = set(('plugin_name', 'configuration', 'description'))
-    #
-    if len(workflow) == 0:
-        return False
-    for plugin in workflow:
-        # test whether every field in required_fields is in plugin keys
-        if not required_fields.issubset(set(plugin.keys())):
-            return False
-        if not isinstance(plugin['configuration'], dict):
-            return False
-        try:
-            _import_plugin(plugin['plugin_name'])
-        except (AttributeError, ImportError):
-            return False
-    return True
+    results = []
+
+    for flow in workflow:
+        if not 'plugin_name' in flow:
+            return None
+        if not 'description' in flow:
+            return None
+        if not 'configuration' in flow:
+            return None
+
+    for flow in workflow:
+        wf = Workflow()
+        wf.plugin_name = flow['plugin_name']
+        wf.configuration = json.dumps(flow['configuration'])
+        wf.description = flow['description']
+        results.append(wf)
+    return results
 
 def _check_plan_exists(plan_name):
     return plans.find_one({'name': plan_name}) is not None
@@ -120,20 +124,17 @@ def _check_plan_exists(plan_name):
 def get_plans():
     name = request.args.get('name')
     if name:
-        plan = get_plan_by_plan_name(name)
+        plan = Plan.get_plan(name)
         if not plan:
-            return jsonify(success=True, plans=[])
+            return jsonify(success=False, reason="no-such-plan")
         else:
-            # Fill in the details of the plugin
-            for step in plan['workflow']:
-                plugin = plugins.get(step['plugin_name'])
-            return jsonify(success=True, plans=[sanitize_plan(plan)])
+            return jsonify(success=True, plans=[plan.dict()])
     else:
         email = request.args.get('email')
         if email:
             plans = get_plans_by_email(email)
         else:
-            plans = get_sanitized_plans()
+            plans = map(lambda x : x.dict(), Plan.query.all())
         return jsonify(success=True, plans=plans)
 
 #
@@ -145,10 +146,13 @@ def get_plans():
 @app.route('/plans/<plan_name>', methods=['DELETE'])
 @api_guard
 def delete_plan(plan_name):
-    if not get_plan_by_plan_name(plan_name):
+    plan = Plan.get_plan(plan_name)
+    if not plan:
         return jsonify(success=False, reason="Plan does not exist.")
-    # Remove the plan
-    plans.remove({'name': plan_name})
+
+    # XX assess the impact of deleting a plan against existing scans?
+    db.session.delete(plan)
+    db.session.commit()
     return jsonify(success=True)
 
 #
@@ -161,21 +165,28 @@ def create_plan():
     plan = request.json
 
     # Verify incoming plan
-    if plans.find_one({'name': plan['name']}) is not None:
+    if Plan.get_plan(plan['name']) is not None:
         return jsonify(success=False, reason='plan-already-exists')
 
-    if not _check_plan_workflow(plan['workflow']):
+    workflows = create_workflows_from_json(plan['workflow'])
+    if not workflows:
         return jsonify(success=False, reason='invalid-plan-exists')
 
     # Create the plan
-    new_plan = { 'name': plan['name'],
-                 'description': plan['description'],
-                 'workflow': plan['workflow'],
-                 'created': datetime.datetime.utcnow() }
-    plans.insert(new_plan)
+    new_plan = Plan()
+    new_plan.name = plan['name']
+    new_plan.description = plan['description']
 
+    db.session.add(new_plan)
+    db.session.commit()
+
+    for workflow in workflows:
+        db.session.add(workflow)
+        new_plan.workflows.append(workflow)
+        db.session.commit()
+
+    plan = Plan.get_plan(new_plan.name)
     # Return the new plan
-    plan = plans.find_one({"name": plan['name']})
     if not plan:
         return jsonify(success=False)
     return jsonify(success=True, plan=sanitize_plan(plan))
@@ -188,22 +199,31 @@ def create_plan():
 @api_guard
 @permission
 def update_plan(plan_name):
-    if not get_plan_by_plan_name(plan_name):
-        return jsonify(success=True)
+    plan = Plan.get_plan(plan_name)
+
+    if not plan:
+        return jsonify(success=False, reason='no-such-plan')
+
     new_plan = request.json
-    if not _check_plan_workflow(new_plan['workflow']):
+
+    new_workflow = create_workflows_from_json(new_plan['workflow'])
+    if not new_workflow:
         return jsonify(success=False, reason='invalid-plan')
 
-    # Update the plan
-    changes = {}
-    if 'description' in new_plan:
-        changes['description'] = new_plan['description']
-    if 'workflow' in new_plan:
-        changes['workflow'] = new_plan['workflow']
-    plans.update({'name': plan_name}, {'$set': changes})
-    # Return the plan
-    plan = plans.find_one({"name": plan_name})
-    return jsonify(success=True, plan=sanitize_plan(plan))
+    plan.name = new_plan.get("name", plan.name)
+    plan.description = new_plan.get("description", plan.description)
+
+    old_flows = map(lambda x: x, plan.workflows)
+    for flow in old_flows:
+        plan.workflows.remove(flow)    
+
+    for new_flow in new_workflow:
+        db.session.add(new_flow)
+        plan.workflows.append(new_flow)        
+    
+    db.session.commit()
+
+    return jsonify(success=True, plan=sanitize_plan(Plan.get_plan(plan.name)))
 
 
 #
@@ -229,10 +249,7 @@ def update_plan(plan_name):
 @permission
 def get_plan(plan_name):
     plan = get_plan_by_plan_name(plan_name)
-    if plan:
-        # Fill in the details of the plugin
-        for step in plan['workflow']:
-            plugin = plugins.get(step['plugin_name'])
-        return jsonify(success=True, plan=sanitize_plan(plan))
-    else:
+    if not plan:
         return jsonify(success=False, reason="Plan does not exist")
+    return jsonify(success=True, plan=sanitize_plan(plan))
+        

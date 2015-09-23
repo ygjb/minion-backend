@@ -1,8 +1,9 @@
-#!/usr/bin/env python
+﻿#!/usr/bin/env python
 
 import calendar
 import datetime
 import importlib
+import json
 import uuid
 
 from flask import jsonify, request
@@ -10,8 +11,8 @@ from flask import jsonify, request
 import minion.backend.utils as backend_utils
 import minion.backend.tasks as tasks
 from minion.backend.app import app
-from minion.backend.views.base import api_guard, scans, sites, users, scanschedules
-from minion.backend.views.users import _find_sites_for_user, _find_sites_for_user_by_group_name
+from minion.backend.views.base import api_guard
+from minion.backend.models import db, User, Group, Site, ScanSchedule, Scan
 from minion.backend.views.scans import sanitize_scan, summarize_scan
 
 # API Methods to return reports
@@ -28,15 +29,27 @@ from minion.backend.views.scans import sanitize_scan, summarize_scan
 def get_reports_history():
     history = []
     user_email = request.args.get('user')
+    scans = []
     if user_email is not None:
-        user = users.find_one({'email': user_email})
+        user = User.get_user(user_email)
         if user is None:
             return jsonify(success=False, reason='no-such-user')
-        for s in scans.find({'configuration.target': {'$in': _find_sites_for_user(user_email)}}).sort("created", -1).limit(100):
-            history.append(summarize_scan(sanitize_scan(s)))
+
+        
+        # Get Sites
+        for site in user.sites():
+            for scan in Site.get_site_by_url(site).scans:
+                scans.append(scan)
+
+        scans.sort(key=lambda x : x.created, reverse = True)
+        # Get Scans for Sites
     else:
-        for s in scans.find({}).sort("created", -1).limit(100):
-            history.append(summarize_scan(sanitize_scan(s)))
+        for site in Site.query.all():
+            for scan in site.scans:
+                scans.append(scan)
+
+    for s in scans[:100]:
+            history.append(summarize_scan(s))
     return jsonify(success=True, report=history)
 
 #
@@ -63,35 +76,63 @@ def get_reports_history():
 #       }],
 #    'success': True }
 
+# XXX this whole thing just shows how fucky the data model is.  Sites / Scans need to be strongly linked, and we shouldn't have to do voodo to filter scans by name/site/plan/etc.
 @app.route('/reports/status', methods=['GET'])
 @api_guard
 def get_reports_sites():
     result = []
     group_name = request.args.get('group_name')
     user_email = request.args.get('user')
+
     if user_email is not None:
         # User specified, so return recent scans for each site/plan that the user can see
-        user = users.find_one({'email': user_email})
+        user = User.get_user(user_email)
         if user is None:
             return jsonify(success=False, reason='no-such-user')
         if group_name:
-            site_list = _find_sites_for_user_by_group_name(user_email, group_name)
+            group = Group.get_group(group_name)
+            if group is None:
+                return jsonify(success=False, reason='no-such-group')
+
+            site_list = map(lambda x: x.url, group.sites)
         else:
-            site_list = _find_sites_for_user(user_email)
+            site_list = user.sites()
         for site_url in sorted(site_list):
-            site = sites.find_one({'url': site_url})
+            site = Site.get_site_by_url(site_url)
             if site is not None:
-                for plan_name in site['plans']:
-                    schedule = scanschedules.find_one({'site':site_url, 'plan':plan_name})
+                for plan in site.plans:
+                    plan_name = plan.name
+                    schedule = ScanSchedule.get_schedule(site.site_uuid, plan.plan_uuid)
+
                     crontab = None
                     scheduleEnabled = False
                     if schedule is not None:
                         crontab = schedule['crontab']
                         scheduleEnabled = schedule['enabled']
 
-                    l = list(scans.find({'configuration.target':site['url'], 'plan.name': plan_name}).sort("created", -1).limit(1))
+                    scans = []
+                    for scan in site.scans:
+                        if scan.plan is not None:
+                            p = json.loads(scan.plan)
+                            if p['name'] == plan_name:
+                                scans.append(scan)                    
+
+                    scan_for_site = []
+                    for scan in scans:
+                        config = json.loads(scan.configuration)
+                        
+                        if config.get('target', None) == site_url:
+                            scan_for_site.append(scan)
+
+
+                    o = list(sorted(scan_for_site, cmp= lambda x, y: cmp(x.created, y, created)))
+                    if len(o):
+                     l = [o[0]]
+                    else:
+                     l = []         
+                    
                     if len(l) == 1:
-                        scan = summarize_scan(sanitize_scan(l[0]))
+                        scan = summarize_scan(l[0])
                         s = {v: scan.get(v) for v in ('id', 'created', 'state', 'issues')}
                         result.append({'target': site_url, 'plan': plan_name, 'scan': scan, 'crontab': crontab, 'scheduleEnabled': scheduleEnabled})
                     else:
@@ -119,25 +160,43 @@ def get_reports_issues():
     user_email = request.args.get('user')
     if user_email is not None:
         # User specified, so return recent scans for each site/plan that the user can see
-        user = users.find_one({'email': user_email})
+        user = User.get_user(user_email)
         if user is None:
             return jsonify(success=False, reason='no-such-user')
+        site_list = []
         if group_name:
+            # get list of sites for group
+
             site_list = _find_sites_for_user_by_group_name(user_email, group_name)
+            
+            g = Group.get_group(group_name)
+            if g:
+                for site in g.sites:
+                    site_list.append(site.url)
+
+
         else:
-            site_list = _find_sites_for_user(user_email)
+            site_list = User.get_user(user_email).sites()
+
 
         for site_url in sorted(site_list):
             r = {'target': site_url, 'issues': []}
-            site = sites.find_one({'url': site_url})
+            site = Site.get_site_by_url(site_url)
             if site is not None:
-                for plan_name in site['plans']:
-                    for s in scans.find({'configuration.target':site['url'], 'plan.name': plan_name}).sort("created", -1).limit(1):
-                        for session in s['sessions']:
-                            for issue in session['issues']:
-                                r['issues'].append({'severity': issue['Severity'],
-                                                    'summary': issue['Summary'],
-                                                    'scan': { 'id': s['id'] },
-                                                    'id': issue['Id']})
+                scan_list = []
+                for scan in site.scans:
+                    scan_list.append(scan)
+
+                if len(scan_list) > 0:
+                    scan_list.sort(key=lambda x : x.created, reverse=True)
+                    s = scan_list[0]
+                    for session in s.sessions:
+                            for issue in session.issues:
+                                r['issues'].append({'severity': issue.severity,
+                                                    'summary': issue.summary,
+                                                    'scan': { 'id': s.scan_uuid},
+                                                    'id': issue.issue_uuid})    
+
+                
             result.append(r)
     return jsonify(success=True, report=result)

@@ -1,10 +1,11 @@
-# This Source Code Form is subject to the terms of the Mozilla Public
+﻿# This Source Code Form is subject to the terms of the Mozilla Public
 # License, v. 2.0. If a copy of the MPL was not distributed with this
 # file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
 import Queue
 import datetime
 import json
+import logging
 import os
 import signal
 import socket
@@ -21,7 +22,6 @@ from celery.execute import send_task
 from celery.signals import celeryd_after_setup
 from celery.task.control import revoke
 from celery.utils.log import get_task_logger
-from pymongo import MongoClient
 import requests
 from twisted.internet import reactor
 from twisted.internet.error import ProcessDone, ProcessTerminated, ProcessExitedAlready
@@ -29,33 +29,26 @@ from twisted.internet.protocol import ProcessProtocol
 
 from minion.backend import ownership
 from minion.backend.utils import backend_config, scan_config, scannable
-
+from minion.backend.models import Plan, Scan, db, Session, Issue
 
 cfg = backend_config()
 celery = Celery('tasks', broker=cfg['celery']['broker'], backend=cfg['celery']['backend'])
 
 # If the config does not mention mongo then we do not set it up. That is ok because
 # that will only happen in plugin-workers that do not need direct mongodb access.
-if cfg.get('mongodb') is not None:
-    mongodb = MongoClient(host=cfg['mongodb']['host'], port=cfg['mongodb']['port'])
-    db = mongodb.minion
-    plans = db.plans
-    scans = db.scans
 
 logger = get_task_logger(__name__)
 
 
-def find_session(scan, session_id):
-    for session in scan['sessions']:
-        if session['id'] == session_id:
-            return session
-
 
 @celery.task
 def scan_start(scan_id, t):
-    scans.update({"id": scan_id},
-                 {"$set": {"state": "STARTED",
-                           "started": datetime.datetime.utcfromtimestamp(t)}})
+    scan = Scan.get_scan(scan_id)
+    old_state = scan.state
+    scan.state = "STARTED"
+    scan.started =  datetime.datetime.utcfromtimestamp(t)
+    logger.debug("Starting scan [%s] [%s -> %s]" % (scan_id, old_state, scan.state))
+    db.session.commit()
 
 
 @celery.task
@@ -65,16 +58,20 @@ def run_scheduled_scan(target, plan):
         'plan': plan,
         'configuration': {'target': target},
         'user': 'cron'
-      } 
+      }
 
     r = requests.post(cfg['api']['url'] + "/scans", 
         headers={'Content-Type':'application/json'},
         data=json.dumps(data));
     r.raise_for_status()
     scan_id = r.json()['scan']['id']
+
+
     
     logger.debug("Scheduled scan created - Target:" + target + " Plan:" + plan + " Request result: " + str(r.status_code))
     
+
+
     #2: Start the scan
     q = requests.put(cfg['api']['url'] + "/scans/" + scan_id + "/control",
         headers={'Content-Type':'text/plain'},
@@ -90,14 +87,14 @@ def run_scheduled_scan(target, plan):
 
 @celery.task
 def scan_finish(scan_id, state, t, failure=None):
-
+    logger.debug("Attempting to finish scan for [%s] in state [%s]" % (scan_id, state))
     try:
 
         #
         # Find the scan we are asked to finish
         #
+        scan = Scan.get_scan(scan_id)
 
-        scan = scans.find_one({'id': scan_id})
         if not scan:
             logger.error("Cannot find scan %s" % scan_id)
             return
@@ -107,24 +104,27 @@ def scan_finish(scan_id, state, t, failure=None):
         #
 
         if failure:
-            scans.update({"id": scan_id},
-                         {"$set": {"state": state,
-                                   "finished": datetime.datetime.utcfromtimestamp(t),
-                                   "failure": failure}})
+            scan.state = state
+            scan.finished =  datetime.datetime.utcfromtimestamp(t)
+            scan.failure = failure
         else:
-            scans.update({"id": scan_id},
-                         {"$set": {"state": state,
-                                   "finished": datetime.datetime.utcfromtimestamp(t)}})
+            scan.state = state
+            scan.finished =  datetime.datetime.utcfromtimestamp(t)
+
+        db.session.commit()
 
         #
         # Fire the callback
         #
 
         try:
-            callback = scan['configuration'].get('callback')
+            logger.debug("... Attempting to to invoke callback")
+            config = json.loads(scan.configuration)
+
+            callback = config.get('callback')
             if callback:
                 r = requests.post(callback['url'], headers={"Content-Type": "application/json"},
-                                  data=json.dumps({'event': 'scan-state', 'id': scan['id'], 'state': state}))
+                                  data=json.dumps({'event': 'scan-state', 'id': scan.uuid, 'state': state}))
                 r.raise_for_status()
         except Exception as e:
             logger.exception("(Ignored) failure while calling scan state callback for scan %s" % scan['id'])
@@ -133,24 +133,25 @@ def scan_finish(scan_id, state, t, failure=None):
         # If there are remaining plugin sessions that are still in the CREATED state
         # then change those to CANCELLED because we wont be executing them anymore.
         #
-
-        for s in scan['sessions']:
-            if s['state'] == 'CREATED':
-                s['state'] = 'CANCELLED'
-                scans.update({"id": scan_id, "sessions.id": s['id']},
-                             {"$set": {"sessions.$.state": "CANCELLED"}})
+        for s in scan.sessions:
+            if s.state == 'CREATED':
+                s.state = 'CANCELLED'
+        db.session.commit()
 
     except Exception as e:
 
         logger.exception("Error while finishing scan. Trying to mark scan as FAILED.")
 
         try:
-            scans.update({"id": scan_id},
-                         {"$set": {"state": "FAILED",
-                                   "finished": datetime.datetime.utcnow()}})
+            scan = Scan.get_scan(scan_id)
+            scan.state = "FAILED"
+            scan.finished = datetime.datetime.utcnow()
+            
         except Exception as e:
             logger.exception("Error when marking scan as FAILED")
 
+
+#pointer
 @celery.task
 def scan_stop(scan_id):
 
@@ -162,7 +163,7 @@ def scan_stop(scan_id):
         # Find the scan we are asked to stop
         #
 
-        scan = scans.find_one({'id': scan_id})
+        scan = Scan.get_scan(scan_id)
         if not scan:
             logger.error("Cannot find scan %s" % scan_id)
             return
@@ -170,18 +171,22 @@ def scan_stop(scan_id):
         #
         # Set the scan to cancelled. Even though some plugins may still run.
         #
+        logger.debug("Stopping scan %s [%s -> STOPPED]" % (scan.uuid, scan.state))
+        scan.state = "STOPPED"
+        scan.started = datetime.datetime.utcnow()
 
-        scans.update({"id": scan_id}, {"$set": {"state": "STOPPED", "started": datetime.datetime.utcnow()}})
 
         #
         # Set all QUEUED and STARTED sessions to STOPPED and revoke the sessions that have been queued
         #
 
-        for session in scan['sessions']:
-            if session['state'] in ('QUEUED', 'STARTED'):
-                scans.update({"id": scan_id, "sessions.id": session['id']}, {"$set": {"sessions.$.state": "STOPPED", "sessions.$.finished": datetime.datetime.utcnow()}})
-            if '_task' in session:
-                revoke(session['_task'], terminate=True, signal='SIGUSR1')
+        for session in scan.sessions:
+            if session.state in ('QUEUED', 'STARTED'):
+                session.state = "STOPPED"
+                session.finished = datetime.datetime.utcnow()
+                db.session.commit()
+            if session.task:
+                revoke(session.task, terminate=True, signal='SIGUSR1')
 
     except Exception as e:
 
@@ -189,46 +194,69 @@ def scan_stop(scan_id):
 
         try:
             if scan:
-                scans.update({"id": scan_id}, {"$set": {"state": "FAILED", "finished": datetime.datetime.utcnow()}})
+                scan = Scan.get_scan(scan_id)
+                scan.state = "FAILED"
+                scan.finished = datetime.datetime.utcnow()
+                db.session.commit()
         except Exception as e:
             logger.exception("Error when marking scan as FAILED")
 
 @celery.task
 def session_queue(scan_id, session_id, t):
-    scans.update({"id": scan_id, "sessions.id": session_id},
-                 {"$set": {"sessions.$.state": "QUEUED",
-                           "sessions.$.queued": datetime.datetime.utcfromtimestamp(t)}})
+    logger.debug("Queuing session [%s] for scan [%s]" % (session_id, scan_id))
+    scan = Scan.get_scan(scan_id)
+    for session in scan.sessions:
+        session.state = "QUEUED"
+        scan.queued = datetime.datetime.utcfromtimestamp(t)
+    db.session.commit()
 
 @celery.task
 def session_start(scan_id, session_id, t):
-    scans.update({"id": scan_id, "sessions.id": session_id},
-                 {"$set": {"sessions.$.state": "STARTED",
-                           "sessions.$.started": datetime.datetime.utcfromtimestamp(t)}})
+    scan = Scan.get_scan(scan_id)
+    logger.debug("Starting session [%s] for scan [%s] [%s -> STARTED]" % (session_id, scan_id, scan.state))
+    for session in scan.sessions:
+        session.state = "STARTED"
+        session.started = datetime.datetime.utcfromtimestamp(t)
+    
+    db.session.commit()
+    
 
 @celery.task
 def session_set_task_id(scan_id, session_id, task_id):
-    scans.update({"id": scan_id, "sessions.id": session_id},
-                 {"$set": {"sessions.$._task": task_id}})
+    scan = Scan.get_scan(scan_id)
+    logger.debug("Setting task id for session [%s]" % (session_id))
+    for s in scan.sessions:
+        if s.uuid == session_id:
+            s.task = task_id
+    db.session.commit()
 
 @celery.task
 def session_report_issue(scan_id, session_id, issue):
-    scans.update({"id": scan_id, "sessions.id": session_id},
-                 {"$push": {"sessions.$.issues": issue}})
+    logger.debug("Starting session [%s] for scan [%s]" % (session_id, scan_id))
+    session = Session.get_session(session_id)
+
+    i = Issue()
+    i.code = issue["Code"]
+    i.description = issue["Description"]
+
+    i.further_info = json.dumps(issue["FurtherInfo"])
+    i.urls = json.dumps(issue["URLs"])
+    i.severity = issue["Severity"]
+    i.summary = issue["Summary"]
+
+    db.session.add(i)
+    session.issues.append(i)
+    db.session.commit()
 
 @celery.task
 def session_finish(scan_id, session_id, state, t, failure=None):
-    if failure:
-        scans.update({"id": scan_id, "sessions.id": session_id},
-                     {"$set": {"sessions.$.state": state,
-                               "sessions.$.finished": datetime.datetime.utcfromtimestamp(t),
-                               "sessions.$.failure": failure}})
-    else:
-        scans.update({"id": scan_id, "sessions.id": session_id},
-                     {"$set": {"sessions.$.state": state,
-                               "sessions.$.finished": datetime.datetime.utcfromtimestamp(t)}})
-
-
-
+    #  params = [scan['id'], session['id'], msg['data']['state'], time.time(), msg['data']['failure']]
+    logger.debug("Finishing session [%s] for scan [%s]" % (session_id, scan_id))
+    s = Session.get_session(session_id)
+    s.state = state
+    s.finished = datetime.datetime.utcfromtimestamp(t)
+    s.failure = failure
+    db.session.commit()
 
 # plugin_worker
 
@@ -390,7 +418,7 @@ def run_plugin(scan_id, session_id):
         # Find the scan for this plugin session. Bail out if the scan has been marked as STOPPED or if
         # the state is not STARTED.
         #
-
+        logger.debug("Retrieving scan to run plugin [%s]" % scan_id)
         scan = get_scan(cfg['api']['url'], scan_id)
         if not scan:
             logger.error("Cannot load scan %s" % scan_id)
@@ -409,11 +437,13 @@ def run_plugin(scan_id, session_id):
         #
 
         session = find_session(scan, session_id)
+        db_session = Session.get_session(session_id)
+
         if not session:
             logger.error("Cannot find session %s/%s" % (scan_id, session_id))
             return
 
-        if session['state'] != 'QUEUED':
+        if db_session.state != 'QUEUED':
             logger.error("Session %s/%s has invalid state. Expected QUEUED but got %s" % (scan_id, session_id, session['state']))
             return
 
@@ -423,7 +453,11 @@ def run_plugin(scan_id, session_id):
         send_task("minion.backend.tasks.session_start",
                   [scan_id, session_id, time.time()],
                   queue='state').get()
+        scan['state'] = 'STARTED'
 
+        db_scan = Scan.get_scan(scan['id'])
+        db_scan.state = 'STARTED'
+        db.session.commit()
         finished = None
 
         #
@@ -485,11 +519,15 @@ def run_plugin(scan_id, session_id):
 
                 # Finish: update the session state, wait for the plugin runner to finish, return the state
                 if msg['msg'] == 'finish':
+                    logger.debug("MESSAGE : %s" % json.dumps(msg))
                     finished = msg['data']['state']
+                    
                     if msg['data']['state'] in ('FINISHED', 'FAILED', 'STOPPED', 'TERMINATED', 'TIMEOUT', 'ABORTED'):
-                        send_task("minion.backend.tasks.session_finish",
-                                  [scan['id'], session['id'], msg['data']['state'], time.time(), msg['data']['failure']],
-                                  queue='state').get()
+                        try:
+                          params = [scan['id'], session['id'], msg['data']['state'], time.time(), msg['data'].get('failure')]
+                        except Exception as e:
+                            logger.debug("[Error] %s" % e)
+                        send_task("minion.backend.tasks.session_finish", args = params, queue='state').get()
 
             except Queue.Empty:
                 pass
@@ -557,13 +595,13 @@ def queue_for_session(session, cfg):
 
 @celery.task(ignore_result=True)
 def scan(scan_id):
-
+    logger.debug("Starting scan [%s] (scan:572)" % scan_id)
     try:
 
         #
         # See if the scan exists.
         #
-
+        logger.debuging("Retrieving scan for scan() [%s]" % scan_id)
         scan = get_scan(cfg['api']['url'], scan_id)
         if not scan:
             logger.error("Cannot load scan %s" % scan_id)
@@ -580,11 +618,12 @@ def scan(scan_id):
         #
         # Move the scan to the STARTED state
         #
-
+        db_scan = Scan.get_scan(scan['id'])
+        db_scan.state = 'STARTED'
         scan['state'] = 'STARTED'
-        send_task("minion.backend.tasks.scan_start",
-                  [scan_id, time.time()],
-                  queue='state').get()
+        db.session.commit()
+        
+        send_task("minion.backend.tasks.scan_start", [scan_id, time.time()], queue='state').get()
 
         #
         # Check this site against the access control lists
@@ -625,7 +664,10 @@ def scan(scan_id):
             # Mark the session as QUEUED
             #
 
+            db_session = Session.get_session(session['id'])
+            db_session.state = 'QUEUED'
             session['state'] = 'QUEUED'
+            db.session.commit()
             #scans.update({"id": scan['id'], "sessions.id": session['id']}, {"$set": {"sessions.$.state": "QUEUED", "sessions.$.queued": datetime.datetime.utcnow()}})
             send_task("minion.backend.tasks.session_queue",
                       [scan['id'], session['id'], time.time()],
@@ -634,8 +676,8 @@ def scan(scan_id):
             #
             # Execute the plugin. The plugin worker will set the session state and issues.
             #
-
-            logger.info("Scan %s running plugin %s" % (scan['id'], session['plugin']['class']))
+            db.session.commit()
+            
 
             queue = queue_for_session(session, cfg)
             result = send_task("minion.backend.tasks.run_plugin",
@@ -652,8 +694,11 @@ def scan(scan_id):
             except TaskRevokedError as e:
                 plugin_result = "STOPPED"
 
+            db_session = Session.get_session(session['id'])
+            db_session.state = plugin_result
             session['state'] = plugin_result
 
+            db.session.commit()
             #
             # If the user stopped the workflow or if the plugin aborted then stop the whole scan
             #
@@ -668,6 +713,9 @@ def scan(scan_id):
                 for s in scan['sessions']:
                     if s['state'] == 'CREATED':
                         s['state'] = 'CANCELLED'
+                        dbs =  Session.get_session(s['id'])
+                        s.state = 'CANCELLED'
+                        db.session.commit()
                         #scans.update({"id": scan['id'], "sessions.id": s['id']}, {"$set": {"sessions.$.state": "CANCELLED", "sessions.$.finished": datetime.datetime.utcnow()}})
                         send_task("minion.backend.tasks.session_finish",
                                   [scan['id'], s['id'], "CANCELLED", time.time()],
@@ -680,12 +728,18 @@ def scan(scan_id):
         #
 
         scan['state'] = 'FINISHED'
+        db_scan = Scan.get_scan(scan['id'])
+        db_scan.state = 'FINISHED'
+        db.session.commit()
 
         #
         # If one of the plugin has failed then marked the scan as failed
         #
         for session in scan['sessions']:
             if session['state'] == 'FAILED':
+                db_scan = Scan.get_scan(scan['id'])
+                db_scan.state = 'FAILED'
+                db.session.commit()
                 scan['state'] = 'FAILED'
 
         #scans.update({"id": scan_id}, {"$set": {"state": "FINISHED", "finished": datetime.datetime.utcnow()}})
